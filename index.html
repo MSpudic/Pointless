@@ -264,7 +264,10 @@ const STORE='pointless_mp_v2', PSTORE='pointless_player_v2';
 const TIMER=30, MAX_PLAYERS=60;
 const CODE_CH='ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 // ?peerhost=host:port points at a private PeerJS server (used for offline testing).
-function peerOptions(){let h=P.get('peerhost');if(!h)return {debug:0};let [host,port]=h.split(':');return {host,port:+port||9000,path:'/',secure:false,debug:0,config:{iceServers:[]}}}
+// Optional TURN relay (e.g. a free ExpressTURN account) for networks that block device-to-device links.
+function turnSettings(){let t=null;if(MODE==='host')t=state&&state.settings&&state.settings.turn;else{try{let raw=P.get('ice');if(raw)t=JSON.parse(atob(raw))}catch(e){}if(!t){try{t=(JSON.parse(localStorage.getItem(PSTORE))||{}).turn}catch(e){}}}return t&&t.h&&t.u&&t.p?t:null}
+function iceConfig(){let list=[{urls:'stun:stun.l.google.com:19302'},{urls:['turn:eu-0.turn.peerjs.com:3478','turn:us-0.turn.peerjs.com:3478'],username:'peerjs',credential:'peerjsp'}];let t=turnSettings();if(t){let h=String(t.h).replace(/^(turns?:|https?:\/\/)/,'').replace(/[:\/].*$/,'');list.unshift({urls:[`turn:${h}:3478?transport=udp`,`turn:${h}:3478?transport=tcp`,`turns:${h}:443?transport=tcp`],username:t.u,credential:t.p})}return {iceServers:list}}
+function peerOptions(){let h=P.get('peerhost');if(!h)return {debug:0,config:iceConfig()};let [host,port]=h.split(':');return {host,port:+port||9000,path:'/',secure:false,debug:0,config:{iceServers:[]}}}
 
 // ---------- helpers
 const $=id=>document.getElementById(id);
@@ -375,12 +378,12 @@ function revealSkip(){clearTimeout(revealTimer);state.revealStep=boardTiles().le
 // =====================================================================
 //  NETWORK · HOST SIDE (PeerJS)
 // =====================================================================
-let peer=null,conns=new Map(),netStatus={ok:false,msg:'Not started'},peerRetry=null;
+let peer=null,conns=new Map(),netStatus={ok:false,msg:'Not started'},peerRetry=null,stuckPhones=0;
 function startHostPeer(){if(MODE!=='host'||peer||typeof Peer==='undefined'){if(typeof Peer==='undefined'){netStatus={ok:false,msg:'Phone joining library failed to load.'};render()}return}
  netStatus={ok:false,msg:'Connecting to the relay…'};
  try{peer=new Peer(PEER_PREFIX+state.code,peerOptions())}catch(e){netStatus={ok:false,msg:'Could not start phone joining: '+e.message};render();return}
  peer.on('open',()=>{netStatus={ok:true,msg:'Ready for phones'};render()});
- peer.on('connection',c=>{c.on('data',d=>onPlayerData(c,d));c.on('close',()=>{for(const [id,x] of conns)if(x===c){conns.delete(id);softRender()}});c.on('error',()=>{})});
+ peer.on('connection',c=>{setTimeout(()=>{if(!c.open){stuckPhones++;softRender()}},15000);c.on('data',d=>onPlayerData(c,d));c.on('close',()=>{for(const [id,x] of conns)if(x===c){conns.delete(id);softRender()}});c.on('error',()=>{})});
  peer.on('disconnected',()=>{netStatus={ok:false,msg:'Lost the relay. Reconnecting…'};render();setTimeout(()=>{try{peer&&!peer.destroyed&&peer.reconnect()}catch(e){}},1500)});
  peer.on('error',e=>{let t=e.type||'';if(t==='unavailable-id'){netStatus={ok:false,msg:'Re-opening this game code (a few seconds after a reload)…'};render();try{peer.destroy()}catch(x){}peer=null;clearTimeout(peerRetry);peerRetry=setTimeout(startHostPeer,4000);return}
   if(t==='peer-unavailable')return;
@@ -412,7 +415,7 @@ function viewFor(id){let p=byId(id);if(!p||p.removed)return {kicked:true};let sp
 function broadcast(){if(MODE!=='host')return;for(const [id,c] of conns){try{if(c.open)c.send({t:'view',v:viewFor(id)})}catch(e){}}}
 function sendTick(){if(MODE!=='host')return;for(const [,c] of conns){try{if(c.open)c.send({t:'tick',s:state.seconds,run:state.timerRunning})}catch(e){}}}
 function joinBase(){let b=(state.settings.joinBase||'').trim();if(b)return b.split(/[?#]/)[0];return location.href.split(/[?#]/)[0]}
-function joinUrl(){let u=joinBase()+'?join='+state.code;let ph=P.get('peerhost');if(ph)u+='&peerhost='+encodeURIComponent(ph);return u}
+function joinUrl(){let u=joinBase()+'?join='+state.code;let t=turnSettings();if(t)u+='&ice='+encodeURIComponent(btoa(JSON.stringify({h:t.h,u:t.u,p:t.p})));let ph=P.get('peerhost');if(ph)u+='&peerhost='+encodeURIComponent(ph);return u}
 const localFile=()=>location.protocol==='file:'&&!(state.settings.joinBase||'').trim();
 
 // =====================================================================
@@ -429,7 +432,7 @@ let dispNet=null,dispJoin='',dispLocal=false;
 // =====================================================================
 function timerBlock(){let c=clock();return `<div class="timerbox"><div id="bigTimer" class="bigtimer">${c}</div><div class="row host-only">${btn(state.timerRunning?'❚❚ Pause':'▶ Start timer','timerToggle','small','id="bigTimerBtn"')}${btn('↺','timerReset','ghost small','title="Reset timer" aria-label="Reset timer"')}</div></div>`}
 const clock=()=>`${String(Math.floor(state.seconds/60)).padStart(2,'0')}:${String(state.seconds%60).padStart(2,'0')}`;
-function netBadge(){let n=MODE==='display'?dispNet:netStatus;if(!n)return '';return `<div class="${n.ok?'ok':'warn'} mt">${n.ok?'● ':'⚠ '}${esc(n.msg)}</div>`}
+function netBadge(){let n=MODE==='display'?dispNet:netStatus;if(!n)return '';let stuck=MODE==='host'?stuckPhones:(n.stuck||0);return `<div class="${n.ok?'ok':'warn'} mt">${n.ok?'● ':'⚠ '}${esc(n.msg)}</div>${stuck&&MODE==='host'?`<div class="warn mt" style="text-align:left"><strong>${stuck} connection attempt${stuck>1?'s':''} couldn’t get through.</strong> A phone found this game, but the network blocked the direct link between the phone and this laptop. ${turnSettings()?'Your TURN relay is on, so check its username and password on the setup screen.':'Add a free TURN relay on the setup screen (under “Phones stuck on Connecting?”), or put the phones and this laptop on the same Wi-Fi.'}</div>`:''}`}
 function keyChips(qq){return `<div class="keychips">${qq.items.slice().sort((a,b)=>a.s-b.s).map(i=>`<span class="keychip ${i.s===0?'k0':i.s>=100?'k100':''}">${esc(i.a)}<b>${i.s>=100?'✗':i.s}</b></span>`).join('')}</div>${qq.note?`<p class="tiny">${esc(qq.note)}</p>`:''}`}
 function qLabel(){return `Question ${state.qIndex+1} of ${state.plan.length}`}
 
@@ -439,6 +442,7 @@ function renderSetup(){let s=state.settings;let avail=BANK.filter(b=>s.cats.incl
 <p class="eyebrow mt">Categories <span class="tiny" style="letter-spacing:0;text-transform:none">· ${avail} questions available</span></p><div class="catgrid">${CATS.map(c=>`<label><input type="checkbox" data-cat="${esc(c)}" ${s.cats.includes(c)?'checked':''}> ${esc(c)} <span class="tiny">(${BANK.filter(b=>b.cat===c).length})</span></label>`).join('')}</div>
 <div class="row mt"><label class="row" style="gap:8px"><span class="eyebrow">Answer time</span><select id="timerLen" style="width:auto">${[20,30,45,60,90].map(x=>`<option value="${x}" ${x===s.timerLength?'selected':''}>${x} seconds</option>`).join('')}</select></label><label class="row" style="gap:8px"><input type="checkbox" id="autoClose" ${s.autoClose?'checked':''}> <span class="help">Close answers when the timer ends</span></label></div>
 ${location.protocol==='file:'?`<div class="warn mt"><strong>You’ve opened the game from a file on this computer.</strong> Phones can’t open that. Open the game from its web address (e.g. GitHub Pages) or paste that address here so the QR code points to it:<input class="mt" id="joinBase" placeholder="https://yourname.github.io/pointless/pointless_challenge.html" value="${esc(s.joinBase)}"></div>`:''}
+<details class="mt" ${s.turn&&s.turn.u?'open':''}><summary class="help" style="cursor:pointer"><strong>Phones stuck on “Connecting”?</strong> Add a TURN relay (optional)</summary><p class="help">Some networks (often school Wi-Fi or phones on mobile data) block phones from linking straight to this laptop. A TURN relay passes the connection through instead. A free <strong>ExpressTURN</strong> account (expressturn.com) works: sign up, then copy the username and password from its dashboard.</p><div class="grid2"><label><span class="eyebrow">TURN server</span><input id="turnH" value="${esc(s.turn?.h||'relay1.expressturn.com')}" autocomplete="off"></label><label><span class="eyebrow">Username</span><input id="turnU" value="${esc(s.turn?.u||'')}" autocomplete="off"></label><label><span class="eyebrow">Password</span><input id="turnP" value="${esc(s.turn?.p||'')}" autocomplete="off"></label></div><p class="tiny">Saved in this browser and included in the QR link so phones use the same relay.${s.turn&&s.turn.u?' <strong style="color:var(--mint)">Relay on.</strong>':''}</p></details>
 <div class="row mt">${btn('Open the lobby →','openLobby','primary',avail?'':'disabled')}${state.players.length?`<span class="tiny">${active().length} players kept from last game</span>`:''}</div></div>
 <div class="panel"><h2 class="section-title">How to play</h2><p>1. Scan the QR code and type your name.</p><p>2. Each question, answer on your phone before time runs out.</p><p>3. Each answer scores how many of 100 people said it. <strong>Lower is better.</strong> A wrong or missing answer scores 100.</p><p>4. Watch the big board reveal every answer, ending with the pointless ones.</p><p>5. The two lowest totals play the Grand Final with three answers each.</p><p><span class="star" style="margin-left:0">★</span> Find a pointless answer (0 points) to earn a star.</p><hr><p class="help">${BANK.length} questions in ${CATS.length} categories · ${FINALS.length} grand-final questions</p></div></div>
 <p class="help center mt host-only">Second screen connected (extended, not mirrored)? Click <strong>🖥 Audience display</strong> and drag the new window onto the projector. This window becomes your private host view.</p>`}
@@ -557,6 +561,7 @@ function hostEvents(){
   if(t.id==='timerLen'){state.settings.timerLength=+t.value||TIMER;resetTimer();return}
   if(t.id==='autoClose'){state.settings.autoClose=t.checked;persist();return}
   if(t.id==='joinBase'){state.settings.joinBase=t.value.trim();persist();return}
+  if(['turnH','turnU','turnP'].includes(t.id)){state.settings.turn={h:($('turnH')?.value||'').trim(),u:($('turnU')?.value||'').trim(),p:($('turnP')?.value||'').trim()};persist();if(peer){try{peer.destroy()}catch(e){}peer=null}stuckPhones=0;render();return}
   if(t.id==='entryFor'){state._entryFor=t.value;persist();render();return}
   if(t.matches('[data-finalist]')){let i=+t.dataset.finalist;change(()=>{state.finalists[i]=t.value},{undo:false});return}
   if(t.matches('[data-rule]')){let rs=t.dataset.final==='1'?state.finalRulings:state.rulings,k=t.dataset.rule,v=t.value;rs[k]=v==='wrong'?{mode:'wrong'}:v==='accept'?{mode:'accept',s:rs[k]?.s??20}:{mode:'match',match:v.slice(6)};persist();render();return}
@@ -583,18 +588,18 @@ function displayInit(){document.title='Pointless Challenge · Audience display';
 // =====================================================================
 //  PLAYER MODE (phones)
 // =====================================================================
-const ps={status:'join',view:null,err:'',code:'',name:'',pid:'',draft:'',draft3:['','',''],sentFlash:0};
+const ps={status:'join',view:null,err:'',code:'',name:'',pid:'',draft:'',draft3:['','',''],sentFlash:0,stage:'server'};
 let ppeer=null,pconn=null,pRetry=null,pTries=0;
 function pLoad(){try{let s=JSON.parse(localStorage.getItem(PSTORE))||{};ps.pid=s.pid||'';ps.name=s.name||'';if(s.code&&!P.get('join'))ps.code=s.code}catch(e){}if(!ps.pid)ps.pid='p'+Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4);ps.code=(P.get('join')||ps.code||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,5)}
-function pSave(){try{localStorage.setItem(PSTORE,JSON.stringify({pid:ps.pid,name:ps.name,code:ps.code}))}catch(e){}}
+function pSave(){try{localStorage.setItem(PSTORE,JSON.stringify({pid:ps.pid,name:ps.name,code:ps.code,turn:turnSettings()}))}catch(e){}}
 function pConnect(){if(typeof Peer==='undefined'){ps.status='error';ps.err='Couldn’t load the game. Check your internet connection and refresh.';return renderPlayer()}
  ps.status=ps.view?'reconnecting':'connecting';renderPlayer();clearTimeout(pRetry);
- let go=()=>{try{pconn&&pconn.close()}catch(e){}pconn=ppeer.connect(PEER_PREFIX+ps.code,{reliable:true});let opened=false;
-  let to=setTimeout(()=>{if(!opened){try{pconn.close()}catch(e){}pRetryLater()}},12000);
+ let go=()=>{ps.stage='host';renderPlayer();try{pconn&&pconn.close()}catch(e){}pconn=ppeer.connect(PEER_PREFIX+ps.code,{reliable:true});let opened=false;
+  let to=setTimeout(()=>{if(!opened){try{pconn.close()}catch(e){}pRetryLater()}},20000);
   pconn.on('open',()=>{opened=true;clearTimeout(to);pTries=0;pconn.send({t:'hello',pid:ps.pid,name:ps.name})});
   pconn.on('data',onHostData);pconn.on('close',()=>{if(ps.status!=='kicked')pRetryLater()});pconn.on('error',()=>pRetryLater())};
  if(ppeer&&!ppeer.destroyed&&ppeer.open)return go();
- try{ppeer&&ppeer.destroy()}catch(e){}ppeer=new Peer(undefined,peerOptions());
+ ps.stage='server';try{ppeer&&ppeer.destroy()}catch(e){}ppeer=new Peer(undefined,peerOptions());
  ppeer.on('open',go);
  ppeer.on('error',e=>{if(e.type==='peer-unavailable'){if(!ps.view){ps.status='join';ps.err=`No game found with code ${ps.code}. Check the code on the screen.`;renderPlayer();return}pRetryLater();return}pRetryLater()});
  ppeer.on('disconnected',()=>{try{ppeer.reconnect()}catch(e){}})}
@@ -609,7 +614,7 @@ function pSend(m){try{if(pconn&&pconn.open){pconn.send(m);return true}}catch(e){
 function renderPlayer(){document.body.classList.add('player');let ha=$('headActions');if(ha)ha.innerHTML=ps.status==='in'?`<span class="netpill">● ${esc(ps.view?.name||'')}</span>`:ps.status==='reconnecting'?'<span class="netpill bad">Reconnecting…</span>':'';
  let a=document.activeElement,keepFocus=a&&a.id,v=ps.view,app=$('app');let h='';
  if(ps.status==='join'||ps.status==='error'){h=`<div class="pcard"><div class="eyebrow">Join the game</div><h1 class="pq" style="font-size:1.8rem">Pointless Challenge</h1>${ps.err?`<div class="warn mb">${esc(ps.err)}</div>`:''}<label class="eyebrow" for="pName">Your name</label><input id="pName" maxlength="18" autocomplete="nickname" placeholder="First name + initial" value="${esc(ps.name)}"><label class="eyebrow" for="pCode" style="display:block;margin-top:14px">Game code</label><input id="pCode" maxlength="5" autocapitalize="characters" placeholder="ABCDE" value="${esc(ps.code)}" style="text-transform:uppercase;letter-spacing:.2em;font-weight:900"><button class="primary mt" id="pJoin" style="width:100%">Join →</button><p class="tiny mt">Use your real first name so the host knows who you are.</p></div>`}
- else if(ps.status==='connecting'){h=`<div class="pcard center"><div class="eyebrow">Connecting</div><p class="sub">Finding game ${esc(ps.code)}…</p></div>`}
+ else if(ps.status==='connecting'){h=`<div class="pcard center"><div class="eyebrow">Connecting${pTries?` · try ${pTries+1}`:''}</div><p class="sub">${ps.stage==='server'?`Reaching the game server…`:`Found game ${esc(ps.code)} ✓<br>Linking to the teacher’s laptop…`}</p><p class="tiny">${turnSettings()?'Relay: on':'Relay: off'}</p></div>${pTries>=1?`<div class="pcard"><p class="help"><strong>Taking a while?</strong> ${ps.stage==='server'?'Your phone can’t reach the game server. Check you’re online (try turning Wi-Fi off to use mobile data, or back on).':'Your phone found the game but the network is blocking the link to the laptop. Tell your teacher. Joining the same Wi-Fi as the laptop can help.'}</p><button class="ghost" id="pCancel" style="width:100%">← Back</button></div>`:''}`}
  else if(ps.status==='kicked'){h=`<div class="pcard center"><div class="eyebrow">Removed</div><p class="sub">The host removed you from this game.</p><button class="ghost mt" id="pRejoin">Join again</button></div>`}
  else if(v){h=pScreen(v)}else h=`<div class="pcard center"><p class="sub">Reconnecting…</p></div>`;
  app.innerHTML=h;let inp=keepFocus&&$(keepFocus);if(inp&&inp.tagName==='INPUT'){inp.focus();try{inp.setSelectionRange(inp.value.length,inp.value.length)}catch(e){}}}
@@ -629,6 +634,7 @@ const isFinalP=p=>p.startsWith('final')||p==='champion';
 function playerInit(){pLoad();document.title='Join · Pointless Challenge';renderPlayer();if(ps.name&&ps.code)pConnect();
  document.addEventListener('click',e=>{let t=e.target;
   if(t.closest('#pJoin')){let n=cleanName($('pName').value),c=$('pCode').value.toUpperCase().replace(/[^A-Z0-9]/g,'');if(!n){ps.err='Please enter your name.';return renderPlayer()}if(c.length!==5){ps.err='The game code has 5 characters.';ps.name=n;return renderPlayer()}if(c!==ps.code||n!==ps.name){/* new game or name: new identity */if(c!==ps.code)ps.pid='p'+Math.random().toString(36).slice(2,10)+Date.now().toString(36).slice(-4)}ps.name=n;ps.code=c;ps.err='';pSave();pTries=0;pConnect();return}
+  if(t.closest('#pCancel')){clearTimeout(pRetry);try{ppeer&&ppeer.destroy()}catch(e){}ppeer=null;ps.status='join';pTries=0;renderPlayer();return}
   if(t.closest('#pRejoin')){ps.pid='p'+Math.random().toString(36).slice(2,10);ps.status='join';ps.view=null;pSave();renderPlayer();return}
   let o=t.closest('[data-opt]');if(o&&ps.view?.open){if(pSend({t:'answer',qid:ps.view.q.id,a:o.dataset.opt})){document.querySelectorAll('[data-opt]').forEach(b=>b.classList.toggle('sel',b===o));if(navigator.vibrate)navigator.vibrate(30)}return}
   if(t.closest('#pSend')){let a=($('pAns')?.value||'').trim();if(!a)return toast('Type an answer first');if(pSend({t:'answer',qid:ps.view.q.id,a})){ps.draft='';$('pAns').blur();if(navigator.vibrate)navigator.vibrate(30)}return}
